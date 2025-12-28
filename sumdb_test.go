@@ -197,7 +197,8 @@ func TestLookup(t *testing.T) {
 		require.NoError(t, err)
 
 		mod := module.Version{Path: "example.com/new", Version: "v1.0.0"}
-		store.EXPECT().RecordID(gomock.Any(), mod.Path, mod.Version).Return(int64(0), ErrNotFound)
+		// RecordID is called twice: once in Lookup, once in fetchAndStoreRecord (double-check)
+		store.EXPECT().RecordID(gomock.Any(), mod.Path, mod.Version).Return(int64(0), ErrNotFound).Times(2)
 		store.EXPECT().AddRecord(gomock.Any(), gomock.Any()).Return(int64(0), nil)
 		store.EXPECT().ReadHashes(gomock.Any(), gomock.Any()).Return([]tlog.Hash{}, nil).AnyTimes()
 		store.EXPECT().WriteHashes(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
