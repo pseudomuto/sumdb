@@ -1,0 +1,65 @@
+version: 2
+
+# Project metadata
+project_name: sumdb
+
+# Build configuration
+builds:
+  - skip: true
+
+# Archive configuration
+archives:
+  - id: default
+    ids:
+      - sumdb
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE.txt
+      - README.md
+
+# Checksum configuration
+checksum:
+  name_template: "checksums.txt"
+
+# Snapshot configuration
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+# Changelog configuration
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^build:"
+      - "^chore:"
+  groups:
+    - title: Features
+      regexp: "^.*feat[(\\w)]*:+.*$"
+      order: 0
+    - title: Bug Fixes
+      regexp: "^.*fix[(\\w)]*:+.*$"
+      order: 1
+    - title: Others
+      order: 999
+
+# Release configuration
+release:
+  github:
+    owner: pseudomuto
+    name: sumdb
+  draft: false
+  prerelease: auto
+  name_template: "Release {{ .Version }}"
+  header: |
+    ## sumdb - A custom, configurable sumdb implementation.
+
+    ### Installation
+
+    `go get github.com/pseudomuto/sumdb`
+
+  footer: |
+    **Full Changelog**: https://github.com/pseudomuto/sumdb/compare/{{ .PreviousTag }}...{{ .Tag }}
