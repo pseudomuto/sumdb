@@ -16,6 +16,7 @@ import (
 	"golang.org/x/mod/sumdb"
 	"golang.org/x/mod/sumdb/note"
 	"golang.org/x/mod/sumdb/tlog"
+	"golang.org/x/sync/singleflight"
 )
 
 // SumDB is a checksum database server that implements the Go sumdb protocol.
@@ -27,6 +28,9 @@ type SumDB struct {
 	store    Store
 	signer   note.Signer
 	upstream string
+
+	// Used to dedupe proxy calls
+	lookupGroup singleflight.Group
 }
 
 // New creates a new SumDB instance with the given server name and signing key.
@@ -121,12 +125,38 @@ func (s *SumDB) ReadRecords(ctx context.Context, id, n int64) ([][]byte, error) 
 // Lookup finds or creates a record for the given module version.
 // If the record doesn't exist, it fetches the module from the upstream proxy,
 // computes the checksums, and stores the new record with its tree hashes.
+// Concurrent lookups for the same module are deduplicated via singleflight.
 func (s *SumDB) Lookup(ctx context.Context, mod module.Version) (int64, error) {
+	// Fast path - record already exists
 	id, err := s.store.RecordID(ctx, mod.Path, mod.Version)
 	if err == nil {
 		return id, nil
 	}
 
+	if !errors.Is(err, ErrNotFound) {
+		return 0, fmt.Errorf("failed to find record id: %w", err)
+	}
+
+	// Use singleflight to deduplicate concurrent lookups for the same module
+	key := mod.Path + "@" + mod.Version
+	result, err, _ := s.lookupGroup.Do(key, func() (any, error) {
+		return s.fetchAndStoreRecord(ctx, mod)
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return result.(int64), nil
+}
+
+// fetchAndStoreRecord fetches a module from upstream, computes checksums,
+// and stores the record. Called via singleflight to deduplicate concurrent requests.
+func (s *SumDB) fetchAndStoreRecord(ctx context.Context, mod module.Version) (int64, error) {
+	// Double-check: another request may have added it while we waited
+	id, err := s.store.RecordID(ctx, mod.Path, mod.Version)
+	if err == nil {
+		return id, nil
+	}
 	if !errors.Is(err, ErrNotFound) {
 		return 0, fmt.Errorf("failed to find record id: %w", err)
 	}

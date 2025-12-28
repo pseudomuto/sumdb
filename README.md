@@ -5,6 +5,7 @@ A custom implementation of the Go sumdb server.
 [![CI](https://github.com/pseudomuto/sumdb/actions/workflows/ci.yaml/badge.svg)](https://github.com/pseudomuto/sumdb/actions/workflows/ci.yaml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/pseudomuto/sumdb.svg)](https://pkg.go.dev/github.com/pseudomuto/sumdb)
 [![Go Report Card](https://goreportcard.com/badge/github.com/pseudomuto/sumdb)](https://goreportcard.com/report/github.com/pseudomuto/sumdb)
+[![Coverage](https://codecov.io/gh/pseudomuto/sumdb/branch/main/graph/badge.svg)](https://codecov.io/gh/pseudomuto/sumdb)
 
 This package implements the standard [sumdb protocol](https://go.dev/ref/mod#checksum-database) via
 `golang.org/x/mod/sumdb`. When a client requests a module checksum, the server checks the local Store first. If no
