@@ -1,6 +1,6 @@
 package sumdb_test
 
-//go:generate go tool mockgen -destination=store_test.go -package=sumdb_test . Store
+//go:generate go tool mockgen -destination=store_test.go -package=sumdb_test . Store,TxStore
 
 import (
 	"archive/zip"
@@ -207,5 +207,103 @@ func TestLookup(t *testing.T) {
 		id, err := db.Lookup(t.Context(), mod)
 		require.NoError(t, err)
 		require.Equal(t, int64(0), id)
+	})
+}
+
+func TestLookup_WithTxStore(t *testing.T) {
+	// Create minimal module zip in-memory
+	var zipBuf bytes.Buffer
+	zw := zip.NewWriter(&zipBuf)
+	w, err := zw.Create("example.com/txtest@v1.0.0/go.mod")
+	require.NoError(t, err)
+	_, err = w.Write([]byte("module example.com/txtest\n"))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+
+	modContent := []byte("module example.com/txtest\n")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".mod") {
+			_, _ = w.Write(modContent)
+		} else if strings.HasSuffix(r.URL.Path, ".zip") {
+			_, _ = w.Write(zipBuf.Bytes())
+		}
+	}))
+	defer srv.Close()
+
+	t.Run("uses transaction when TxStore is implemented", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		skey, _, err := GenerateKeys("test.example.com")
+		require.NoError(t, err)
+
+		txStore := NewMockTxStore(ctrl)
+		upstream, err := url.Parse(srv.URL)
+		require.NoError(t, err)
+
+		db, err := New("test.example.com", skey, WithStore(txStore), WithUpstream(upstream))
+		require.NoError(t, err)
+
+		mod := module.Version{Path: "example.com/txtest", Version: "v1.0.0"}
+
+		// RecordID is called twice on the outer store:
+		// 1. In Lookup (fast path check)
+		// 2. In fetchAndStoreRecord (double-check before proxy calls)
+		txStore.EXPECT().RecordID(gomock.Any(), mod.Path, mod.Version).Return(int64(0), ErrNotFound).Times(2)
+
+		// Inside transaction: AddRecord, then tree.AddRecord (ReadHashes, WriteHashes, SetTreeSize)
+		// Use ID 0 (first record) - tree.AddRecord for first record only needs WriteHashes and SetTreeSize
+		inner := NewMockStore(ctrl)
+		inner.EXPECT().AddRecord(gomock.Any(), gomock.Any()).Return(int64(0), nil)
+		inner.EXPECT().ReadHashes(gomock.Any(), gomock.Any()).Return([]tlog.Hash{}, nil).AnyTimes()
+		inner.EXPECT().WriteHashes(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		inner.EXPECT().SetTreeSize(gomock.Any(), int64(1)).Return(nil)
+
+		// WithTx is called for the atomic operation (AddRecord + tree.AddRecord)
+		txStore.EXPECT().WithTx(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(ctx any, fn func(Store) error) error {
+				return fn(inner)
+			},
+		)
+
+		id, err := db.Lookup(t.Context(), mod)
+		require.NoError(t, err)
+		require.Equal(t, int64(0), id)
+	})
+
+	t.Run("transaction rollback on error", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		skey, _, err := GenerateKeys("test.example.com")
+		require.NoError(t, err)
+
+		txStore := NewMockTxStore(ctrl)
+		upstream, err := url.Parse(srv.URL)
+		require.NoError(t, err)
+
+		db, err := New("test.example.com", skey, WithStore(txStore), WithUpstream(upstream))
+		require.NoError(t, err)
+
+		mod := module.Version{Path: "example.com/txtest", Version: "v1.0.0"}
+
+		// RecordID called twice on outer store (fast path + double-check)
+		txStore.EXPECT().RecordID(gomock.Any(), mod.Path, mod.Version).Return(int64(0), ErrNotFound).Times(2)
+
+		// Inside transaction: AddRecord fails
+		expectedErr := errors.New("add record failed")
+		inner := NewMockStore(ctrl)
+		inner.EXPECT().AddRecord(gomock.Any(), gomock.Any()).Return(int64(0), expectedErr)
+
+		// WithTx is called but inner operation fails
+		txStore.EXPECT().WithTx(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(ctx any, fn func(Store) error) error {
+				return fn(inner)
+			},
+		)
+
+		_, err = db.Lookup(t.Context(), mod)
+		require.ErrorContains(t, err, "add record failed")
 	})
 }

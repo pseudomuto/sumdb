@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/pseudomuto/sumdb/internal/proxy"
@@ -29,8 +30,13 @@ type SumDB struct {
 	signer   note.Signer
 	upstream string
 
-	// Used to dedupe proxy calls
+	// lookupGroup deduplicates concurrent proxy fetches for the same module.
 	lookupGroup singleflight.Group
+
+	// writeMu serializes record creation to ensure tree consistency.
+	// Each record's position in the Merkle tree depends on the current TreeSize,
+	// so concurrent inserts of different modules must be serialized.
+	writeMu sync.Mutex
 }
 
 // New creates a new SumDB instance with the given server name and signing key.
@@ -185,17 +191,31 @@ func (s *SumDB) fetchAndStoreRecord(ctx context.Context, mod module.Version) (in
 		),
 	}
 
-	id, err = s.store.AddRecord(ctx, rec)
-	if err != nil {
-		return 0, fmt.Errorf("failed to add new record: %s, %w", mod, err)
+	// Serialize tree mutations to ensure consistency.
+	// Each record's position depends on TreeSize, so concurrent inserts must be serialized.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// Atomic operation: add record and update tree hashes
+	var recordID int64
+	if err := s.withTx(ctx, func(store Store) error {
+		var err error
+		recordID, err = store.AddRecord(ctx, rec)
+		if err != nil {
+			return fmt.Errorf("failed to add new record: %s, %w", mod, err)
+		}
+
+		// Compute and store tree hashes for this record
+		if err := tree.AddRecord(ctx, store, recordID, rec.Data); err != nil {
+			return fmt.Errorf("failed to update tree hashes: %s, %w", mod, err)
+		}
+
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 
-	// Compute and store tree hashes for this record
-	if err := tree.AddRecord(ctx, s.store, id, rec.Data); err != nil {
-		return 0, fmt.Errorf("failed to update tree hashes: %s, %w", mod, err)
-	}
-
-	return id, nil
+	return recordID, nil
 }
 
 // ReadTileData returns the raw record data for a data tile.
@@ -207,4 +227,13 @@ func (s *SumDB) ReadTileData(ctx context.Context, t tlog.Tile) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+// withTx executes fn within a transaction if the store supports transactions.
+// If the store does not implement TxStore, fn is executed directly.
+func (s *SumDB) withTx(ctx context.Context, fn func(Store) error) error {
+	if txs, ok := s.store.(TxStore); ok {
+		return txs.WithTx(ctx, fn)
+	}
+	return fn(s.store)
 }
