@@ -10,9 +10,18 @@ import (
 	"golang.org/x/mod/sumdb/tlog"
 )
 
-// dbStore implements sumdb.Store using SQLite.
+// dbtx abstracts sql.DB and sql.Tx for shared query execution.
+type dbtx interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+}
+
+// dbStore implements sumdb.Store and sumdb.TxStore using SQLite.
 type dbStore struct {
-	db   *sql.DB
+	tx   dbtx    // *sql.DB or *sql.Tx - used for all queries
+	db   *sql.DB // original DB - only used by WithTx to start transactions
 	skey string
 	vkey string
 }
@@ -58,6 +67,7 @@ func newDBStore(ctx context.Context, db *sql.DB) (*dbStore, error) {
 	}
 
 	return &dbStore{
+		tx:   db,
 		db:   db,
 		skey: skey,
 		vkey: vkey,
@@ -67,7 +77,7 @@ func newDBStore(ctx context.Context, db *sql.DB) (*dbStore, error) {
 // RecordID returns the ID of the record for the given module path and version.
 func (s *dbStore) RecordID(ctx context.Context, path, version string) (int64, error) {
 	var id int64
-	err := s.db.
+	err := s.tx.
 		QueryRowContext(ctx, "SELECT id FROM records WHERE path = ? AND version = ?", path, version).
 		Scan(&id)
 	if err == sql.ErrNoRows {
@@ -83,7 +93,7 @@ func (s *dbStore) RecordID(ctx context.Context, path, version string) (int64, er
 
 // Records returns records with IDs in the interval [id, id+n).
 func (s *dbStore) Records(ctx context.Context, id, n int64) ([]*sumdb.Record, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.tx.QueryContext(ctx,
 		"SELECT id, path, version, data FROM records WHERE id >= ? AND id < ? ORDER BY id",
 		id, id+n,
 	)
@@ -105,7 +115,7 @@ func (s *dbStore) Records(ctx context.Context, id, n int64) ([]*sumdb.Record, er
 
 // AddRecord adds a new entry for the specified module.
 func (s *dbStore) AddRecord(ctx context.Context, r *sumdb.Record) (int64, error) {
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.tx.ExecContext(ctx,
 		"INSERT INTO records (path, version, data) VALUES (?, ?, ?)",
 		r.Path, r.Version, r.Data,
 	)
@@ -147,7 +157,7 @@ func (s *dbStore) ReadHashes(ctx context.Context, indexes []int64) ([]tlog.Hash,
 	}
 	query.WriteString(")")
 
-	rows, err := s.db.QueryContext(ctx, query.String(), args...)
+	rows, err := s.tx.QueryContext(ctx, query.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query hashes: %w", err)
 	}
@@ -169,13 +179,7 @@ func (s *dbStore) ReadHashes(ctx context.Context, indexes []int64) ([]tlog.Hash,
 
 // WriteHashes stores hashes at the given storage indexes.
 func (s *dbStore) WriteHashes(ctx context.Context, indexes []int64, hashes []tlog.Hash) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.PrepareContext(ctx, "INSERT OR REPLACE INTO hashes (idx, hash) VALUES (?, ?)")
+	stmt, err := s.tx.PrepareContext(ctx, "INSERT OR REPLACE INTO hashes (idx, hash) VALUES (?, ?)")
 	if err != nil {
 		return fmt.Errorf("prepare stmt: %w", err)
 	}
@@ -187,13 +191,13 @@ func (s *dbStore) WriteHashes(ctx context.Context, indexes []int64, hashes []tlo
 		}
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 // TreeSize returns the current number of records in the tree.
 func (s *dbStore) TreeSize(ctx context.Context) (int64, error) {
 	var size int64
-	err := s.db.
+	err := s.tx.
 		QueryRowContext(ctx, "SELECT size FROM tree WHERE id = 1").
 		Scan(&size)
 	if err == sql.ErrNoRows {
@@ -209,7 +213,7 @@ func (s *dbStore) TreeSize(ctx context.Context) (int64, error) {
 
 // SetTreeSize updates the tree size.
 func (s *dbStore) SetTreeSize(ctx context.Context, size int64) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.tx.ExecContext(ctx,
 		"UPDATE tree SET size = ? WHERE id = 1",
 		size,
 	)
@@ -218,4 +222,27 @@ func (s *dbStore) SetTreeSize(ctx context.Context, size int64) error {
 	}
 
 	return nil
+}
+
+// WithTx implements sumdb.TxStore.
+func (s *dbStore) WithTx(ctx context.Context, fn func(sumdb.Store) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
+
+	txStore := &dbStore{tx: tx, db: s.db, skey: s.skey, vkey: s.vkey}
+	if err := fn(txStore); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
 }

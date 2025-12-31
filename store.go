@@ -21,6 +21,10 @@ type (
 
 	// Store defines the persistence interface for sumdb data.
 	// Implementations must be safe for concurrent use.
+	//
+	// A Store instance should only be used by a single SumDB. Sharing a Store
+	// across multiple SumDB instances is not supported and may corrupt the
+	// Merkle tree, as write serialization is handled at the SumDB level.
 	Store interface {
 		// RecordID returns the ID of the record for the given module path and version.
 		// Returns ErrNotFound if no record exists.
@@ -51,5 +55,22 @@ type (
 		// SetTreeSize updates the tree size.
 		// This should be called after successfully adding a record and its hashes.
 		SetTreeSize(ctx context.Context, size int64) error
+	}
+
+	// TxStore is an optional extension of Store that provides transaction support.
+	// When a Store implements TxStore, atomic operations will use transactions.
+	//
+	// Implementations that do not support transactions can simply implement Store.
+	// The SumDB will detect TxStore support at runtime and use transactions when available.
+	TxStore interface {
+		Store
+
+		// WithTx executes fn within a database transaction.
+		// If fn returns nil, the transaction is committed.
+		// If fn returns an error or panics, the transaction is rolled back.
+		//
+		// The Store passed to fn represents the transactional view and must be used
+		// for all operations within the callback.
+		WithTx(ctx context.Context, fn func(Store) error) error
 	}
 )
